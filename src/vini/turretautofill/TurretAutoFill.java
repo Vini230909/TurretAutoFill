@@ -23,11 +23,16 @@ import mindustry.world.blocks.defense.turrets.ItemTurret;
 public class TurretAutoFill extends Mod {
     private static final boolean DEBUG = true;
 
-    private static final float TRANSFER_DELAY = 6f;
+    private static final float TRANSFER_DELAY = 10f;
+    private static final float TRANSFER_CONFIRM_TIMEOUT = 12f;
     private static final int MIN_TRANSFER = 1;
 
     private boolean enabled = false;
     private float transferTimer = 0f;
+
+    private boolean waitingForTransfer = false;
+    private float transferConfirmTimer = 0f;
+    private int heldAmountBeforeTransfer = 0;
 
     private int lastTurretCount = 0;
     private int lastCompatibleCount = 0;
@@ -80,9 +85,6 @@ public class TurretAutoFill extends Mod {
     }
 
     private void updateAutoFill() {
-        lastTurretCount = 0;
-        lastCompatibleCount = 0;
-
         if(!enabled || !Vars.state.isGame() || Vars.player == null || Vars.player.dead()){
             return;
         }
@@ -99,6 +101,16 @@ public class TurretAutoFill extends Mod {
         if(heldItem == null || heldAmount <= 0){
             return;
         }
+        if(waitingForTransfer){
+            transferConfirmTimer += Time.delta;
+
+            if(unit.item() == null || unit.stack.amount < heldAmountBeforeTransfer || transferConfirmTimer >= TRANSFER_CONFIRM_TIMEOUT){
+                waitingForTransfer = false;
+            transferConfirmTimer = 0f;
+        }else{
+            return;
+            }
+        }
 
         if(Vars.player.team() == null || Vars.player.team().data() == null || Vars.player.team().data().buildingTree == null){
             return;
@@ -107,6 +119,9 @@ public class TurretAutoFill extends Mod {
         float range = Vars.itemTransferRange;
         float px = Vars.player.x;
         float py = Vars.player.y;
+        
+        lastTurretCount = 0;
+        lastCompatibleCount = 0;
 
         builds.clear();
 
@@ -158,6 +173,10 @@ public class TurretAutoFill extends Mod {
 
         Call.transferInventory(Vars.player, bestTarget);
         lastFilledCount++;
+
+        waitingForTransfer = true;
+        transferConfirmTimer = 0f;
+        heldAmountBeforeTransfer = heldAmount;
     }
 
     private void updateDebugUi() {
