@@ -22,5 +22,6 @@ minGameVersion: 154
 #this is a java mod
 java: true
 
+repo: "Vini230909/TurretAutoFill"
 hidden: true
 legacyCompatible: true
