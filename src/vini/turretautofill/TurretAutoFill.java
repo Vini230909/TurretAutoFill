@@ -25,18 +25,48 @@ public class TurretAutoFill extends Mod {
 
     private static final float TRANSFER_DELAY = 10f;
     private static final float TRANSFER_CONFIRM_TIMEOUT = 12f;
+
+    private static final float PICKUP_DELAY = 20f;
+    private static final float PICKUP_CONFIRM_TIMEOUT = 30f;
+
+    private static final float DROP_DELAY = 10f;
+    private static final float DROP_CONFIRM_TIMEOUT = 20f;
+
     private static final int MIN_TRANSFER = 1;
+    private static final int MIN_CORE_ITEMS = 1;
 
     private boolean enabled = false;
+
     private float transferTimer = 0f;
+    private float pickupTimer = 0f;
+    private float dropTimer = 0f;
 
     private boolean waitingForTransfer = false;
     private float transferConfirmTimer = 0f;
     private int heldAmountBeforeTransfer = 0;
 
+    private boolean waitingForPickup = false;
+    private float pickupConfirmTimer = 0f;
+
+    private boolean waitingForCoreDrop = false;
+    private float dropConfirmTimer = 0f;
+    private Item dropItemBefore = null;
+    private int dropAmountBefore = 0;
+
+    private boolean coreSessionActive = false;
+    private boolean coreSessionDone = false;
+    private Item originalItem = null;
+    private boolean restoringOriginalItem = false;
+
     private int lastTurretCount = 0;
     private int lastCompatibleCount = 0;
     private int lastFilledCount = 0;
+    private int lastPickupCount = 0;
+    private int lastDropCount = 0;
+
+    private String lastPickupItem = "None";
+    private String lastOriginalItem = "None";
+    private boolean lastCoreInRange = false;
 
     private final Seq<Building> builds = new Seq<>(false);
 
@@ -50,17 +80,19 @@ public class TurretAutoFill extends Mod {
 
         Events.on(EventType.ClientLoadEvent.class, event -> {
             createDebugUi();
+            AmmoPriorities.addSettingsCategory();
         });
 
         Events.run(EventType.Trigger.update, () -> {
             if(Core.input.keyTap(TAFKeybinds.toggle)){
                 enabled = !enabled;
 
+                resetRuntimeState();
+
                 if(enabled){
                     showToast("Auto Fill: [lightgray]Enabled");
                 }else{
                     showToast("Auto Fill: [scarlet]Disabled");
-                    lastFilledCount = 0;
                 }
 
                 Log.info("TurretAutoFill: " + (enabled ? "Enabled" : "Disabled"));
@@ -69,6 +101,27 @@ public class TurretAutoFill extends Mod {
             updateAutoFill();
             updateDebugUi();
         });
+    }
+
+    private void resetRuntimeState() {
+        waitingForTransfer = false;
+        waitingForPickup = false;
+        waitingForCoreDrop = false;
+
+        transferConfirmTimer = 0f;
+        pickupConfirmTimer = 0f;
+        dropConfirmTimer = 0f;
+
+        coreSessionActive = false;
+        coreSessionDone = false;
+        originalItem = null;
+        restoringOriginalItem = false;
+
+        lastFilledCount = 0;
+        lastPickupCount = 0;
+        lastDropCount = 0;
+        lastPickupItem = "None";
+        lastOriginalItem = "None";
     }
 
     private void createDebugUi() {
@@ -95,20 +148,237 @@ public class TurretAutoFill extends Mod {
             return;
         }
 
+        Building core = getCoreInRange();
+        lastCoreInRange = core != null;
+
+        if(core != null){
+            updateCoreRangeMode(unit, core);
+        }else{
+            resetCoreSessionOnly();
+
+            Item heldItem = unit.item();
+            int heldAmount = unit.stack.amount;
+
+            if(heldItem != null && heldAmount > 0){
+                updateHeldAmmoTransfer(unit, heldItem, heldAmount, false, null);
+            }
+        }
+    }
+
+    private void resetCoreSessionOnly() {
+        coreSessionActive = false;
+        coreSessionDone = false;
+        originalItem = null;
+        restoringOriginalItem = false;
+        lastOriginalItem = "None";
+
+        waitingForPickup = false;
+        waitingForCoreDrop = false;
+        pickupConfirmTimer = 0f;
+        dropConfirmTimer = 0f;
+    }
+
+    private void updateCoreRangeMode(Unit unit, Building core) {
+        if(coreSessionDone){
+            if(findBestCoreWantedItem(unit, core) == null){
+                return;
+            }
+
+            coreSessionDone = false;
+        }
+
+        if(!coreSessionActive){
+            originalItem = unit.item();
+            lastOriginalItem = originalItem == null ? "None" : originalItem.localizedName;
+            coreSessionActive = true;
+            restoringOriginalItem = false;
+        }
+
+        if(waitingForCoreDrop){
+            dropConfirmTimer += Time.delta;
+
+            Item current = unit.item();
+            int amount = unit.stack.amount;
+
+            if(current == null || amount <= 0 || current != dropItemBefore || amount < dropAmountBefore || dropConfirmTimer >= DROP_CONFIRM_TIMEOUT){
+                waitingForCoreDrop = false;
+                dropConfirmTimer = 0f;
+                dropItemBefore = null;
+                dropAmountBefore = 0;
+            }else{
+                return;
+            }
+        }
+
+        if(waitingForPickup){
+            pickupConfirmTimer += Time.delta;
+
+            if(unit.item() != null || pickupConfirmTimer >= PICKUP_CONFIRM_TIMEOUT){
+                waitingForPickup = false;
+                pickupConfirmTimer = 0f;
+            }else{
+                return;
+            }
+        }
+
         Item heldItem = unit.item();
         int heldAmount = unit.stack.amount;
 
-        if(heldItem == null || heldAmount <= 0){
+        if(heldItem != null && heldAmount > 0){
+            if(hasCoreModeTargetsForItem(unit, core, heldItem)){
+                updateHeldAmmoTransfer(unit, heldItem, heldAmount, true, core);
+                return;
+            }
+
+            Item wantedItem = findBestCoreWantedItem(unit, core);
+
+            if(wantedItem == null){
+                finishCoreSession(unit, core);
+            }else{
+                dropHeldItemToCore(unit, core);
+            }
+
             return;
         }
+
+        Item wantedItem = findBestCoreWantedItem(unit, core);
+
+        if(wantedItem == null){
+            finishCoreSession(unit, core);
+            return;
+        }
+
+        requestItemFromCore(core, wantedItem);
+    }
+
+    private boolean hasCoreModeTargetsForItem(Unit unit, Building core, Item item) {
+        if(item == null) return false;
+        if(Vars.player.team() == null || Vars.player.team().data() == null || Vars.player.team().data().buildingTree == null) return false;
+
+        float range = Vars.itemTransferRange;
+        float px = Vars.player.x;
+        float py = Vars.player.y;
+
+        builds.clear();
+
+        Vars.player.team().data().buildingTree.intersect(
+            px - range,
+            py - range,
+            range * 2f,
+            range * 2f,
+            builds
+        );
+
+        for(Building build : builds){
+            if(build == null) continue;
+            if(build.team != Vars.player.team()) continue;
+            if(!(build.block instanceof ItemTurret)) continue;
+            if(!Vars.player.within(build, range)) continue;
+            if(!build.block.consumesItem(item)) continue;
+
+            Item bestAmmo = bestAvailableAmmoForTurret(build, unit, core);
+            if(bestAmmo != item) continue;
+
+            int accepted = build.acceptStack(item, Integer.MAX_VALUE, unit);
+            if(accepted >= MIN_TRANSFER){
+                return true;
+            }
+        }
+
+        return false;
+    }
+        private void finishCoreSession(Unit unit, Building core) {
+            Item heldItem = unit.item();
+            int heldAmount = unit.stack.amount;
+
+            if(heldItem != null && heldAmount > 0){
+                if(restoringOriginalItem && originalItem != null && heldItem == originalItem){
+                    restoringOriginalItem = false;
+                    coreSessionActive = false;
+                    coreSessionDone = true;
+                    originalItem = null;
+                    lastOriginalItem = "None";
+                    return;
+                }
+
+                if(originalItem != null && heldItem == originalItem){
+                    coreSessionActive = false;
+                    coreSessionDone = true;
+                    originalItem = null;
+                    lastOriginalItem = "None";
+                    return;
+                }
+
+                dropHeldItemToCore(unit, core);
+                return;
+            }
+
+            if(originalItem != null && core.items != null && core.items.has(originalItem, MIN_CORE_ITEMS)){
+                restoringOriginalItem = true;
+                requestItemFromCore(core, originalItem);
+                return;
+            }
+
+            coreSessionActive = false;
+            coreSessionDone = true;
+            originalItem = null;
+            lastOriginalItem = "None";
+            restoringOriginalItem = false;
+        }
+
+    private void dropHeldItemToCore(Unit unit, Building core) {
+        Item heldItem = unit.item();
+        int heldAmount = unit.stack.amount;
+
+        if(heldItem == null || heldAmount <= 0) return;
+
+        dropTimer += Time.delta;
+
+        if(dropTimer < DROP_DELAY){
+            return;
+        }
+
+        dropTimer = 0f;
+
+        Call.transferInventory(Vars.player, core);
+
+        waitingForCoreDrop = true;
+        dropConfirmTimer = 0f;
+        dropItemBefore = heldItem;
+        dropAmountBefore = heldAmount;
+        lastDropCount++;
+    }
+
+    private void requestItemFromCore(Building core, Item item) {
+        if(item == null) return;
+        if(core.items == null || !core.items.has(item, MIN_CORE_ITEMS)) return;
+
+        pickupTimer += Time.delta;
+
+        if(pickupTimer < PICKUP_DELAY){
+            return;
+        }
+
+        pickupTimer = 0f;
+
+        Call.requestItem(Vars.player, core, item, Integer.MAX_VALUE);
+
+        lastPickupCount++;
+        lastPickupItem = item.localizedName;
+
+        waitingForPickup = true;
+        pickupConfirmTimer = 0f;
+    }
+
+    private void updateHeldAmmoTransfer(Unit unit, Item heldItem, int heldAmount, boolean coreMode, Building core) {
         if(waitingForTransfer){
             transferConfirmTimer += Time.delta;
 
             if(unit.item() == null || unit.stack.amount < heldAmountBeforeTransfer || transferConfirmTimer >= TRANSFER_CONFIRM_TIMEOUT){
                 waitingForTransfer = false;
-            transferConfirmTimer = 0f;
-        }else{
-            return;
+                transferConfirmTimer = 0f;
+            }else{
+                return;
             }
         }
 
@@ -119,7 +389,7 @@ public class TurretAutoFill extends Mod {
         float range = Vars.itemTransferRange;
         float px = Vars.player.x;
         float py = Vars.player.y;
-        
+
         lastTurretCount = 0;
         lastCompatibleCount = 0;
 
@@ -145,6 +415,11 @@ public class TurretAutoFill extends Mod {
             lastTurretCount++;
 
             if(!build.block.consumesItem(heldItem)) continue;
+
+            if(coreMode){
+                Item bestAmmo = bestAvailableAmmoForTurret(build, unit, core);
+                if(bestAmmo != heldItem) continue;
+            }
 
             int accepted = build.acceptStack(heldItem, heldAmount, unit);
             if(accepted < MIN_TRANSFER) continue;
@@ -179,6 +454,102 @@ public class TurretAutoFill extends Mod {
         heldAmountBeforeTransfer = heldAmount;
     }
 
+    private Item findBestCoreWantedItem(Unit unit, Building core) {
+        if(Vars.player.team() == null || Vars.player.team().data() == null || Vars.player.team().data().buildingTree == null){
+            return null;
+        }
+
+        int itemCount = Vars.content.items().size;
+        float[] itemScores = new float[itemCount];
+
+        float range = Vars.itemTransferRange;
+        float px = Vars.player.x;
+        float py = Vars.player.y;
+
+        lastTurretCount = 0;
+        lastCompatibleCount = 0;
+
+        builds.clear();
+
+        Vars.player.team().data().buildingTree.intersect(
+            px - range,
+            py - range,
+            range * 2f,
+            range * 2f,
+            builds
+        );
+
+        for(Building build : builds){
+            if(build == null) continue;
+            if(build.team != Vars.player.team()) continue;
+            if(!(build.block instanceof ItemTurret)) continue;
+            if(!Vars.player.within(build, range)) continue;
+
+            lastTurretCount++;
+
+            Item bestAmmo = bestAvailableAmmoForTurret(build, unit, core);
+
+            if(bestAmmo == null) continue;
+
+            int accepted = build.acceptStack(bestAmmo, Integer.MAX_VALUE, unit);
+            if(accepted < MIN_TRANSFER) continue;
+
+            itemScores[bestAmmo.id] += 1000f + accepted;
+            lastCompatibleCount++;
+        }
+
+        int bestId = -1;
+        float bestScore = 0f;
+
+        for(int i = 0; i < itemScores.length; i++){
+            if(itemScores[i] > bestScore){
+                bestScore = itemScores[i];
+                bestId = i;
+            }
+        }
+
+        if(bestId == -1){
+            return null;
+        }
+
+        return Vars.content.item(bestId);
+    }
+
+    private Item bestAvailableAmmoForTurret(Building build, Unit unit, Building core) {
+        if(build == null || !(build.block instanceof ItemTurret)) return null;
+
+        Seq<Item> priority = AmmoPriorities.getActiveAmmo(build.block);
+        Item heldItem = unit.item();
+
+        for(Item item : priority){
+            if(item == null) continue;
+            if(!build.block.consumesItem(item)) continue;
+
+            boolean availableInCore = core != null && core.items != null && core.items.has(item, MIN_CORE_ITEMS);
+            boolean availableInUnit = heldItem == item && unit.stack.amount > 0;
+
+            if(!availableInCore && !availableInUnit) continue;
+
+            int accepted = build.acceptStack(item, Integer.MAX_VALUE, unit);
+            if(accepted < MIN_TRANSFER) continue;
+
+            return item;
+        }
+
+        return null;
+    }
+
+    private Building getCoreInRange() {
+        if(Vars.player == null) return null;
+
+        Building core = Vars.player.closestCore();
+
+        if(core == null) return null;
+        if(!Vars.player.within(core, Vars.itemTransferRange)) return null;
+
+        return core;
+    }
+
     private void updateDebugUi() {
         if(!DEBUG){
             if(debugTable != null) debugTable.visible = false;
@@ -208,6 +579,10 @@ public class TurretAutoFill extends Mod {
             "Turrets: [lightgray]" + lastTurretCount + "\n" +
             "Compatible: [lightgray]" + lastCompatibleCount + "\n" +
             "Filled: [lightgray]" + lastFilledCount + "\n" +
+            "Core: " + (lastCoreInRange ? "[lightgray]Yes" : "[scarlet]No") + "\n" +
+            "Pickup: [lightgray]" + lastPickupItem + " x" + lastPickupCount + "\n" +
+            "Drops: [lightgray]" + lastDropCount + "\n" +
+            "Original: [lightgray]" + lastOriginalItem + "\n" +
             "Held: [lightgray]" + held + " x" + amount
         );
 
